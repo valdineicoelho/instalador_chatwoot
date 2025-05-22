@@ -1,77 +1,111 @@
 #!/bin/bash
 
-# === CONFIGURÁVEIS ===
-DOMAIN="chatwoot.suporteuniplus.com.br"
-ADMIN_EMAIL="admin@suporte.com.br"
-ADMIN_PASSWORD="123456"
+echo "=== INSTALADOR CHATWOOT DOCKER ==="
 
-echo "🚀 Atualizando pacotes..."
-sudo apt update && sudo apt upgrade -y
+# Solicitar domínio
+read -p "Digite o domínio completo (ex: chatwoot.suporteuniplus.com.br): " DOMINIO
 
-echo "📦 Instalando dependências..."
-sudo apt install -y git curl docker.io docker-compose nginx certbot python3-certbot-nginx
+# Criar swap se necessário
+if [ "$(free | grep Swap | awk '{print $2}')" == "0" ]; then
+  echo "Criando swap de 2GB..."
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
 
-echo "📁 Clonando Chatwoot..."
-git clone https://github.com/chatwoot/chatwoot.git /opt/chatwoot
+# Atualizar sistema e instalar dependências
+apt update && apt install -y docker.io docker-compose nginx certbot python3-certbot-nginx openssl git
+
+# Diretório de instalação
+mkdir -p /opt/chatwoot
 cd /opt/chatwoot
 
-echo "⚙️ Copiando .env padrão..."
-cp .env.example .env
+# Criar docker-compose.yml
+cat > docker-compose.yml <<EOF
+version: "3.8"
 
-echo "📝 Atualizando .env..."
-sed -i "s|FRONTEND_URL=.*|FRONTEND_URL=https://$DOMAIN|" .env
-echo "FORCE_SSL=true" >> .env
-
-echo "📝 Criando docker-compose.override.yml..."
-cat <<EOF > docker-compose.override.yml
-version: '3'
 services:
-  rails:
+  chatwoot:
+    image: chatwoot/chatwoot:latest
+    container_name: chatwoot
+    env_file: .env
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+      - redis
+    restart: always
+
+  postgres:
+    image: postgres:14
+    container_name: chatwoot_postgres
     environment:
-      - RAILS_ENV=production
-      - FRONTEND_URL=https://$DOMAIN
-      - FORCE_SSL=true
+      POSTGRES_DB: chatwoot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: always
+
+  redis:
+    image: redis:7
+    container_name: chatwoot_redis
+    volumes:
+      - redisdata:/data
+    restart: always
+
+volumes:
+  pgdata:
+  redisdata:
 EOF
 
-echo "🐳 Construindo containers..."
-docker-compose build
+# Gerar SECRET_KEY_BASE
+SECRET_KEY=$(openssl rand -hex 64)
 
-echo "🔼 Subindo containers..."
-docker-compose up -d
+# Criar .env
+cat > .env <<EOF
+RAILS_ENV=production
+SECRET_KEY_BASE=$SECRET_KEY
+FRONTEND_URL=https://$DOMINIO
+INSTALLATION_ENV=docker
 
-echo "🌐 Configurando NGINX..."
-cat <<EOF | sudo tee /etc/nginx/sites-available/chatwoot
+POSTGRES_HOST=postgres
+POSTGRES_USERNAME=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_DATABASE=chatwoot
+
+REDIS_URL=redis://redis:6379
+EOF
+
+# Criar configuração Nginx
+cat > /etc/nginx/sites-available/chatwoot <<EOF
 server {
     listen 80;
-    server_name $DOMAIN;
+    server_name $DOMINIO;
 
     location / {
         proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_cache_bypass \$http_upgrade;
     }
 }
 EOF
 
-sudo ln -s /etc/nginx/sites-available/chatwoot /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl restart nginx
+# Ativar site no Nginx
+ln -s /etc/nginx/sites-available/chatwoot /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
 
-echo "🔒 Instalando certificado SSL com Certbot..."
-sudo certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $ADMIN_EMAIL
+# Obter certificado SSL
+certbot --nginx -d $DOMINIO --non-interactive --agree-tos -m admin@$DOMINIO
 
-echo "⏳ Aguardando containers iniciarem..."
-sleep 20
+# Subir Chatwoot
+docker-compose up -d
 
-echo "👤 Criando usuário admin..."
-docker exec -i chatwoot-rails-1 bash <<EOF
-bundle exec rails db:chatwoot_prepare
-bundle exec rails runner "user = User.create!(email: '$ADMIN_EMAIL', password: '$ADMIN_PASSWORD', password_confirmation: '$ADMIN_PASSWORD', account: Account.first, confirmed_at: Time.now); user.add_role :administrator"
-EOF
-
-echo ""
-echo "✅ Chatwoot instalado com sucesso!"
-echo "🔗 Acesse: https://$DOMAIN"
-echo "📧 Login: $ADMIN_EMAIL"
-echo "🔐 Senha: $ADMIN_PASSWORD"
+echo "=================================="
+echo "✅ Chatwoot disponível em: https://$DOMINIO"
+echo "Crie sua conta de administrador ao acessar pela primeira vez."
